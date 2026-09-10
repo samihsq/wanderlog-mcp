@@ -39,7 +39,14 @@ export class TripCache {
 
   private async ensureEntry(tripKey: string): Promise<CacheEntry> {
     const existing = this.entries.get(tripKey);
-    if (existing) return existing;
+    if (existing) {
+      if (this.isFresh(tripKey, existing)) return existing;
+      // Diverged from the live document. Serving this snapshot is how an
+      // agent comes to believe its own successful write did not land, and
+      // then repeats it — which is where duplicate places and notes come
+      // from. Drop it and resubscribe from a fresh snapshot instead.
+      this.deleteEntry(tripKey);
+    }
 
     const pending = this.subscribing.get(tripKey);
     if (pending) return pending;
@@ -51,6 +58,19 @@ export class TripCache {
     } finally {
       this.subscribing.delete(tripKey);
     }
+  }
+
+  /**
+   * A cached entry is only usable if its version still matches the live
+   * ShareDB client's. Every path that advances one advances the other, so a
+   * mismatch means an op went missing — a dropped frame, a reconnect, or an
+   * op we could not apply.
+   */
+  private isFresh(tripKey: string, entry: CacheEntry): boolean {
+    if (!this.pool.has(tripKey)) return false;
+    const client = this.pool.get(tripKey);
+    if (!client.isSubscribed) return false;
+    return entry.version === client.version;
   }
 
   private async subscribeAndCache(tripKey: string): Promise<CacheEntry> {

@@ -458,10 +458,12 @@ export class ShareDBClient extends EventEmitter {
   }
 
   private handleOpFrame(frame: OpFrame): void {
+    const isOurs =
+      this.sessionId !== undefined &&
+      frame.src !== undefined &&
+      frame.src === this.sessionId;
     const isOurAck =
-      frame.src === this.sessionId &&
-      frame.seq !== undefined &&
-      this.pendingOps.has(frame.seq);
+      isOurs && frame.seq !== undefined && this.pendingOps.has(frame.seq);
 
     if (isOurAck) {
       const pending = this.pendingOps.get(frame.seq!)!;
@@ -469,6 +471,16 @@ export class ShareDBClient extends EventEmitter {
       clearTimeout(pending.timer);
       this._version = frame.v + 1;
       pending.resolve();
+      return;
+    }
+
+    if (isOurs) {
+      // Our own op, arriving after we already acked and applied it locally.
+      // The pendingOps check above is one-shot, so without this a second copy
+      // of the frame would be treated as remote and applied twice — an `li`
+      // insert applied twice duplicates a block in the cached snapshot.
+      // Track the version, emit nothing.
+      if (frame.op && frame.op.length > 0) this._version = frame.v + 1;
       return;
     }
 

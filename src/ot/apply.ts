@@ -116,16 +116,23 @@ function applySingleOp(doc: JsonContainer, op: Json0Op): void {
   }
 
   // ShareDB subtype ops — the `t` field names the subtype, `o` is its payload.
-  // We support "rich-text" (Quill Delta compose); unknown subtypes are skipped
-  // so remote ops from the UI don't crash our cache.
+  // We support "rich-text" (Quill Delta compose).
   if ("t" in op && op.t !== undefined) {
     const parent = navigateParent(doc, p);
     const last = p[p.length - 1]!;
     if (op.t === "rich-text") {
       applyRichTextOp(parent, last, op.o);
+      return;
     }
-    // Unknown subtypes: silently skip rather than crash.
-    return;
+    // An unknown subtype must throw, not be skipped. Skipping it and then
+    // letting the cache record the new version marks us in sync while having
+    // dropped that op's content — a silent divergence that makes later reads
+    // confidently wrong. Throwing trips the cache's resubscribe path instead.
+    throw new WanderlogError(
+      `Unsupported ShareDB subtype "${op.t}" at path [${p.map((k) => JSON.stringify(k)).join(", ")}]`,
+      "ot_subtype_unsupported",
+      "The cached trip is dropped and refetched rather than kept in a state that no longer matches the server.",
+    );
   }
 
   if ("r" in op) {
