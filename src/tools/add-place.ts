@@ -5,6 +5,7 @@ import type { Json0Op } from "../ot/apply.js";
 import { noteTextToDelta } from "../ot/rich-text.js";
 import { resolveDay } from "../resolvers/day.js";
 import type { PlaceData } from "../types.js";
+import { findDuplicatePlace } from "./duplicate-guard.js";
 import {
   buildPlaceAmbiguityText,
   buildPlaceBlock,
@@ -80,6 +81,10 @@ wanderlog_add_note call because the note lives on the place itself in the itiner
 Use standalone wanderlog_add_note only for freestanding commentary between places (neighborhood
 context, multi-stop transit, day-level tips that aren't about a specific place).
 
+Re-adding the same place to the same target at the same start time is a no-op: the tool reports
+that it is already there instead of creating a second block. A different start time on the same
+day, or the same place on another day, is treated as a real second visit and is added.
+
 Returns a confirmation including the resolved place name, its full address, and where it was
 added — check the address, because a name alone can hide a wrong match.
 `.trim();
@@ -94,6 +99,19 @@ type Args = {
   start_time?: string;
   end_time?: string;
 };
+
+type Target = { sectionId: number; label: string };
+type Duplicate = { label: string; startTime?: string };
+
+function describeWhere(duplicates: Duplicate[]): string {
+  return duplicates
+    .map((duplicate) => {
+      const preposition = duplicate.label.startsWith("day ") ? "on" : "in";
+      const at = duplicate.startTime ? ` at ${duplicate.startTime}` : "";
+      return `${preposition} ${duplicate.label}${at}`;
+    })
+    .join(" and ");
+}
 
 export async function addPlace(
   ctx: AppContext,
@@ -154,7 +172,6 @@ export async function addPlace(
 
     const mutation = await submitOp(ctx, args.trip_key, async (lockedEntry, submit) => {
       const trip = lockedEntry.snapshot;
-      type Target = { sectionId: number; label: string };
       const targets: Target[] = [];
 
       if (args.day) {
@@ -186,7 +203,28 @@ export async function addPlace(
         targets.push({ sectionId: places.section.id, label: "places to visit" });
       }
 
+      // Runs after resolution so the comparison uses the resolved place_id, and
+      // before any submit so an all-duplicate call writes nothing at all.
+      const duplicates: Duplicate[] = [];
+      const pending: Target[] = [];
       for (const target of targets) {
+        const section = lockedEntry.snapshot.itinerary.sections.find(
+          (candidate) => candidate.id === target.sectionId,
+        );
+        const existing = section
+          ? findDuplicatePlace(section, detail, args.start_time)
+          : undefined;
+        if (existing) {
+          duplicates.push({ label: target.label, startTime: existing.startTime });
+        } else {
+          pending.push(target);
+        }
+      }
+      if (pending.length === 0) {
+        return { added: [], duplicates, tripTitle: trip.title };
+      }
+
+      for (const target of pending) {
         const sectionIndex = lockedEntry.snapshot.itinerary.sections.findIndex(
           (section) => section.id === target.sectionId,
         );
@@ -252,17 +290,28 @@ export async function addPlace(
         }
       }
       return {
-        labelList: targets.map((target) => target.label).join(" and "),
+        added: pending.map((target) => target.label),
+        duplicates,
         tripTitle: trip.title,
       };
     });
+
+    if (mutation.added.length === 0) {
+      // Success-shaped on purpose: the trip already says what the caller asked
+      // it to say, so this is a satisfied request, not a failed one.
+      const text = `${detail.name} is already ${describeWhere(mutation.duplicates)} — nothing added.`;
+      return { content: [{ type: "text", text }] };
+    }
 
     // Echo the resolved address, not just the name: it is the only thing in the
     // transcript that makes a wrong-but-plausible match visible after the write.
     const where = detail.formatted_address ? ` (${detail.formatted_address})` : "";
     const parts = [
-      `Added ${detail.name}${where} to ${mutation.labelList} in "${mutation.tripTitle}".`,
+      `Added ${detail.name}${where} to ${mutation.added.join(" and ")} in "${mutation.tripTitle}".`,
     ];
+    if (mutation.duplicates.length > 0) {
+      parts.push(`Already ${describeWhere(mutation.duplicates)} — not added there again.`);
+    }
     if (args.start_time) {
       parts.push(`Scheduled: ${args.start_time}${args.end_time ? `–${args.end_time}` : ""}.`);
     }

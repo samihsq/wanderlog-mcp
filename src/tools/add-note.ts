@@ -5,6 +5,7 @@ import type { Json0Op } from "../ot/apply.js";
 import { noteTextToDelta, replaceDeltaOps } from "../ot/rich-text.js";
 import { resolvePlaceRef } from "../resolvers/place-ref.js";
 import { isPlaceBlock, type QuillDelta, type TripPlan } from "../types.js";
+import { findDuplicateNote } from "./duplicate-guard.js";
 import {
   buildNoteBlock,
   findBlockById,
@@ -81,6 +82,9 @@ lists of options, "## " headings to group a long note, and [links](https://examp
 bookings and maps. Keep it light — a note is a sentence or two, not a document. Pass
 format: "plain" when the text must be stored verbatim.
 
+Re-adding a note whose text is identical to one already in the target section is a no-op: the
+tool reports the existing note instead of duplicating it.
+
 Returns a confirmation of where the note was added.
 `.trim();
 
@@ -126,6 +130,7 @@ export async function addNote(
       let sectionIndex: number;
       let insertIndex: number;
       let targetLabel: string;
+      let sectionLabel: string;
 
       if (args.after !== undefined) {
         const anchor = resolvePlaceRef(trip, args.after);
@@ -163,11 +168,38 @@ export async function addNote(
           : `block #${anchor.match.block.id}`;
         const section = anchor.match.section;
         targetLabel = `${section.date ?? (section.heading || "the itinerary")}, below ${anchorName}`;
+        sectionLabel = section.date
+          ? `day ${section.date}`
+          : section.heading
+            ? `section "${section.heading}"`
+            : "the itinerary";
       } else {
         const target = evaluateTargetSection(trip, args);
         sectionIndex = target.index;
         insertIndex = target.section.blocks.length;
         targetLabel = target.label;
+        sectionLabel = target.label;
+      }
+
+      // Guards a stale read: an agent that cannot see its own note write would
+      // otherwise retry and leave two copies. "after" only moves the note
+      // within a section, so the check is against the section either way.
+      const delta = noteTextToDelta(args.text, args.format ?? "markdown");
+      const existing = findDuplicateNote(
+        trip.itinerary.sections[sectionIndex]!,
+        delta,
+      );
+      if (existing) {
+        return {
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `An identical note is already in ${sectionLabel} in "${trip.title}" — nothing added.`,
+              },
+            ],
+          },
+        };
       }
 
       const block = buildNoteBlock(userId);
@@ -197,10 +229,7 @@ export async function addNote(
           // A fresh note block already holds the "\n" that terminates a Quill
           // document. Replace it instead of inserting before it, or every note
           // ends with a stray blank paragraph.
-          o: replaceDeltaOps(
-            (inserted.block as { text?: QuillDelta }).text,
-            noteTextToDelta(args.text, args.format ?? "markdown"),
-          ),
+          o: replaceDeltaOps((inserted.block as { text?: QuillDelta }).text, delta),
         },
       ];
       await submit(textOps);
