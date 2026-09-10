@@ -27,6 +27,16 @@ import {
   addNoteInputSchema,
 } from "./tools/add-note.js";
 import {
+  editFlight,
+  editFlightDescription,
+  editFlightInputSchema,
+} from "./tools/edit-flight.js";
+import {
+  editHotel,
+  editHotelDescription,
+  editHotelInputSchema,
+} from "./tools/edit-hotel.js";
+import {
   addPlace,
   addPlaceDescription,
   addPlaceInputSchema,
@@ -237,6 +247,15 @@ of places. A complete itinerary uses these building blocks:
      your own trips use wanderlog_get_trip.
   8. wanderlog_add_transit — ferry / bus / train legs between places (carrier, from/to, dates,
      times). wanderlog_add_car_rental — a rental car with pick-up and drop-off locations/times.
+  9. wanderlog_edit_hotel / wanderlog_edit_flight — CORRECT an existing booking in place:
+     hotel check-in/check-out, flight dates, times, airline, airports, confirmation numbers,
+     traveler names. When a booking changes, edit it — never add a second block for the same
+     stay or leg, which leaves the itinerary showing both.
+
+FORMATTING: note text is markdown by default and renders as Wanderlog rich text. Use **bold**
+for the thing that matters, "- " bullets for options, "## " headings only in long notes, and
+[links](https://example.com) for bookings and maps. Keep notes to a sentence or two; pass
+format: "plain" when text must be stored verbatim.
 
 Example add_place call with all features:
   wanderlog_add_place(trip_key, place: "Sensō-ji", day: "day 1",
@@ -411,6 +430,26 @@ export function buildServer(ctx: AppContext): McpServer {
     },
     requireAuth(ctx, async (args) =>
       annotatePlace(ctx, args as Parameters<typeof annotatePlace>[1])),
+  );
+
+  server.registerTool(
+    "wanderlog_edit_hotel",
+    {
+      title: "Edit a hotel booking on a Wanderlog trip",
+      description: editHotelDescription,
+      inputSchema: editHotelInputSchema,
+    },
+    requireAuth(ctx, async (args) => editHotel(ctx, args as Parameters<typeof editHotel>[1])),
+  );
+
+  server.registerTool(
+    "wanderlog_edit_flight",
+    {
+      title: "Edit a flight on a Wanderlog trip",
+      description: editFlightDescription,
+      inputSchema: editFlightInputSchema,
+    },
+    requireAuth(ctx, async (args) => editFlight(ctx, args as Parameters<typeof editFlight>[1])),
   );
 
   server.registerTool(
