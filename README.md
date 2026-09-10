@@ -19,7 +19,13 @@ The agent calls the tools, interleaves places and notes for each day, adds hotel
 ## What's New (Unreleased)
 
 - `wanderlog_search_hotels` — search Wanderlog's hotel aggregator across airbnb, expedia, google, and kayak. Returns ranked offers with per-vendor price comparison and faceted filter discovery so the LLM never has to memorise Wanderlog's internal enum values.
-- A failed startup authentication probe now gets one shared retry on the first tool call, allowing valid sessions to recover from a transient network or proxy error without restarting the server.
+- A failed startup authentication probe now gets one shared retry on the first tool call, allowing valid sessions to recover from a transient network or proxy error without restarting the server. The failure is cached for 30s rather than for the life of the process, so a transient blip no longer looks permanently like a bad cookie.
+- **Rich text in notes.** Note text is markdown by default and renders as Wanderlog rich text: `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, `[links](https://example.com)`, `#`/`##`/`###` headings, `- ` and `1. ` lists (two-space indentation nests them), and `> ` quotes. Escape a marker with a backslash, or pass `format: "plain"` to store text verbatim. Applies to `wanderlog_add_note`, `wanderlog_add_place`'s inline `note`, and `wanderlog_annotate_place`. The local cache now preserves formatting attributes instead of flattening deltas to plain text.
+- **`wanderlog_edit_hotel`** — correct an existing hotel booking's check-in, check-out, confirmation number, or traveler names, instead of adding a second block for the same stay.
+- **`wanderlog_edit_flight`** — correct a flight's airline name and IATA code, flight number, dates, times, airports, confirmation number, or travelers. Resolves flights by `"outbound"`, `"return"`, `"JL 57"`, `"SFO to NRT"`, an airport code, a departure date, or an ordinal. Arrival is deliberately not required to be after departure, since an eastbound transpacific leg lands at an earlier local clock time.
+- **`wanderlog_add_note` takes `after`** — insert a note directly below the place it belongs to instead of at the end of the day. Notes also no longer end with a stray blank paragraph.
+- **Place references match both ways.** `"BerBerJin Harajuku"` now resolves to a place stored as `"BerBerJin"`, and diacritics are folded so `"Senso-ji"` reaches `"Sensō-ji"`. Exact and substring matching still take priority, so no reference that used to be unique becomes ambiguous. A stored name beginning with an ordinal (`"2nd Street Shimokitazawa"`) is reachable again.
+- An unexpected throw inside a tool is now labelled instead of surfacing to the client as a bare "Tool execution failed", which was indistinguishable from the server process having died.
 
 ## What's New in v0.3.1
 
@@ -95,10 +101,12 @@ and a ryokan in Shinjuku."
 | `wanderlog_search_hotels` | Search Wanderlog's hotel aggregator (airbnb/expedia/google/kayak) with per-vendor deal comparison |
 | `wanderlog_create_trip` | Create a new trip with destination + date range |
 | `wanderlog_add_place` | Add a place to a specific day or general list |
-| `wanderlog_add_note` | Add a note (transit tips, booking info, local advice) |
+| `wanderlog_add_note` | Add a markdown-formatted note (transit tips, booking info, local advice), optionally placed below a specific stop |
 | `wanderlog_edit_note` | Find-and-replace text in notes, place annotations, and checklists |
 | `wanderlog_remove_note` | Remove a standalone note block by natural-language reference |
 | `wanderlog_add_hotel` | Add a hotel booking with check-in/check-out dates |
+| `wanderlog_edit_hotel` | Correct a hotel booking's dates, confirmation number, or traveler names |
+| `wanderlog_edit_flight` | Correct a flight's airline, number, dates, times, airports, confirmation, or travelers |
 | `wanderlog_add_transit` | Add a ferry, bus, or train leg (carrier, from/to, dates/times) to the shared Transit section |
 | `wanderlog_add_car_rental` | Add a rental car with pick-up/drop-off locations and times |
 | `wanderlog_add_checklist` | Add a pre-trip or per-day checklist |
