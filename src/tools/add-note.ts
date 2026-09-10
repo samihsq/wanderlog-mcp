@@ -2,8 +2,9 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import { noteTextToDelta } from "../ot/rich-text.js";
-import type { TripPlan } from "../types.js";
+import { noteTextToDelta, replaceDeltaOps } from "../ot/rich-text.js";
+import { resolvePlaceRef } from "../resolvers/place-ref.js";
+import { isPlaceBlock, type QuillDelta, type TripPlan } from "../types.js";
 import {
   buildNoteBlock,
   findBlockById,
@@ -41,6 +42,13 @@ export const addNoteInputSchema = z
       .describe(
         "Optional day to add the note to. Accepts 'day 2', 'May 4', or ISO '2026-05-04'. If 'section' is also provided, the section takes precedence. Omit both to add to the 'Places to visit' list.",
       ),
+    after: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Insert the note directly BELOW this place instead of at the end of the day. Natural-language place reference, same syntax as wanderlog_annotate_place ('Sensō-ji', 'the hotel', 'Kagurazaka on day 2'). This is how a note becomes connective tissue between two stops rather than a footer. Determines the target section on its own, so 'day' and 'section' are ignored when it is given.",
+      ),
     section: z
       .string()
       .min(1)
@@ -63,6 +71,10 @@ When to add a note (do this after adding each place or group of places):
 - Food/drink recs: "Try the salt beef bagel at Beigel Bake — cash only, open 24hrs"
 - Time guidance: "Budget 2-3 hours here. Open 10am-6pm, closed Tuesdays"
 - Neighborhood context: "This area is great for wandering — no rush, just explore the lanes"
+
+Placement: notes append to the end of the target by default. Pass "after" with the place the
+note belongs under to put it in the right spot — a transit note between two stops is useless
+at the bottom of the day.
 
 Formatting: 'text' is markdown by default, so use **bold** for emphasis, "- " bullets for
 lists of options, "## " headings to group a long note, and [links](https://example.com) for
@@ -110,17 +122,58 @@ export async function addNote(
     const userId = requireUserId(ctx);
     const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
       const trip = entry.snapshot;
-      const target = evaluateTargetSection(trip, args);
+
+      let sectionIndex: number;
+      let insertIndex: number;
+      let targetLabel: string;
+
+      if (args.after !== undefined) {
+        const anchor = resolvePlaceRef(trip, args.after);
+        if (anchor.kind === "none") {
+          throw new WanderlogError(
+            `No place matching "${args.after}" found in "${trip.title}"`,
+            "place_ref_not_found",
+            {
+              hint: "Check the place name, or omit 'after' to append the note to the end of the day.",
+            },
+          );
+        }
+        if (anchor.kind === "ambiguous") {
+          const lines = anchor.candidates.map((c, i) => {
+            const name = isPlaceBlock(c.block) ? c.block.place.name : `block #${c.block.id}`;
+            const where = c.section.date ?? (c.section.heading || "unscheduled");
+            return `  ${i + 1}. ${name} (${where})`;
+          });
+          return {
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `"${args.after}" matches ${anchor.candidates.length} places:\n${lines.join("\n")}\n\nRetry with a more specific reference or an ordinal prefix (e.g. "1st ${args.after}").`,
+                },
+              ],
+              isError: true,
+            },
+          };
+        }
+        sectionIndex = anchor.match.sectionIndex;
+        insertIndex = anchor.match.blockIndex + 1;
+        const anchorName = isPlaceBlock(anchor.match.block)
+          ? anchor.match.block.place.name
+          : `block #${anchor.match.block.id}`;
+        const section = anchor.match.section;
+        targetLabel = `${section.date ?? (section.heading || "the itinerary")}, below ${anchorName}`;
+      } else {
+        const target = evaluateTargetSection(trip, args);
+        sectionIndex = target.index;
+        insertIndex = target.section.blocks.length;
+        targetLabel = target.label;
+      }
+
       const block = buildNoteBlock(userId);
       const insertOps: Json0Op[] = [
         {
-          p: [
-            "itinerary",
-            "sections",
-            target.index,
-            "blocks",
-            target.section.blocks.length,
-          ],
+          p: ["itinerary", "sections", sectionIndex, "blocks", insertIndex],
           li: block,
         },
       ];
@@ -141,12 +194,20 @@ export async function addNote(
             "text",
           ],
           t: "rich-text",
-          o: noteTextToDelta(args.text, args.format ?? "markdown"),
+          // A fresh note block already holds the "\n" that terminates a Quill
+          // document. Replace it instead of inserting before it, or every note
+          // ends with a stray blank paragraph.
+          o: replaceDeltaOps(
+            (inserted.block as { text?: QuillDelta }).text,
+            noteTextToDelta(args.text, args.format ?? "markdown"),
+          ),
         },
       ];
       await submit(textOps);
-      return { targetLabel: target.label, tripTitle: entry.snapshot.title };
+      return { targetLabel, tripTitle: entry.snapshot.title };
     });
+
+    if ("response" in result && result.response) return result.response;
 
     const preview = args.text.length > 60 ? `${args.text.slice(0, 57)}…` : args.text;
     const text = `Added note "${preview}" to ${result.targetLabel} in "${result.tripTitle}".`;
