@@ -8,6 +8,7 @@ import type {
   ChecklistItem,
   Geo,
   PlaceData,
+  PlaceSuggestion,
   RentalCarEndpoint,
   Section,
   TransitEndpoint,
@@ -490,6 +491,320 @@ export function validateChronology(
   }
 }
 
+/* --------------------------------------------------------------------------
+ * Place-query resolution.
+ *
+ * Google autocomplete returns a ranked list, and its top hit is regularly a
+ * different business at the queried address — a request for a clothing shop
+ * came back as the office building next door. Taking predictions[0] blindly
+ * turns that into a silently wrong write, so every resolution here is scored
+ * against what was actually asked for, and the choice goes back to the caller
+ * when the top hit is implausible or effectively tied with the runner-up.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Biased-search radius. Day trips are a normal travel pattern — from a Tokyo
+ * anchor, Kamakura is ~50km and Shisui ~60km — so the bias has to reach well
+ * past the anchor city. Bias is a preference and not a filter, so a generous
+ * radius costs nothing but ranking weight.
+ */
+const DEFAULT_SEARCH_RADIUS_M = 100_000;
+const MAX_SEARCH_RADIUS_M = 500_000;
+/** Half the earth's circumference: a bias this wide is no bias at all. */
+const UNBIASED_SEARCH_RADIUS_M = 20_000_000;
+/** The radius these tools shipped with, kept only as a degradation target. */
+const LEGACY_SEARCH_RADIUS_M = 15_000;
+/** Distance from the trip center past which the confirmation says how far. */
+const FAR_FROM_CENTER_KM = 50;
+/** Match score below which the resolved name is not a plausible answer. */
+const CONFIDENT_SCORE = 0.6;
+/** Score gap below which the top two candidates are an arbitrary choice. */
+const TIE_GAP = 0.1;
+const MAX_PLACE_CANDIDATES = 5;
+
+/**
+ * Fold case, diacritics and punctuation so "Sensō-ji" and "senso ji" compare
+ * equal. `src/resolvers/place-ref.ts` normalizes trip-local names with its own
+ * copy of this idea; the two are deliberately not shared yet.
+ */
+export function normalizePlaceText(text: string): string {
+  return text
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/** Bare numbers are dropped: they match every business at a street address. */
+function placeTokens(text: string): string[] {
+  return normalizePlaceText(text)
+    .split(" ")
+    .filter((token) => token.length > 0 && !/^\d+$/.test(token));
+}
+
+/**
+ * How plausibly `candidate` is the place `query` asked for, 0–1. Two
+ * hand-rolled measures, the better one wins:
+ *   - Dice coefficient over tokens, which rewards overlap while penalizing the
+ *     extra words that distinguish a wrong branch ("… Musical Instruments").
+ *   - Length ratio of one squashed string inside the other, which catches
+ *     spacing differences that tokens miss ("Senso-ji" vs "Sensoji").
+ */
+export function placeMatchScore(query: string, candidate: string): number {
+  const queryTokens = new Set(placeTokens(query));
+  const candidateTokens = new Set(placeTokens(candidate));
+  if (queryTokens.size === 0 || candidateTokens.size === 0) return 0;
+
+  const querySquashed = [...queryTokens].join("");
+  const candidateSquashed = [...candidateTokens].join("");
+  if (querySquashed === candidateSquashed) return 1;
+
+  let shared = 0;
+  for (const token of queryTokens) {
+    if (candidateTokens.has(token)) shared += 1;
+  }
+  const dice = (2 * shared) / (queryTokens.size + candidateTokens.size);
+
+  const nested =
+    candidateSquashed.includes(querySquashed) ||
+    querySquashed.includes(candidateSquashed);
+  const containment = nested
+    ? Math.min(querySquashed.length, candidateSquashed.length) /
+      Math.max(querySquashed.length, candidateSquashed.length)
+    : 0;
+
+  return Math.max(dice, containment);
+}
+
+export function haversineKm(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/**
+ * Search radius for a trip: wide enough for day trips by default, widened to
+ * span the destination geo's own bounds when the trip covers a region or a
+ * country rather than one city.
+ */
+export function tripSearchRadiusM(geos?: Geo[]): number {
+  let radius = DEFAULT_SEARCH_RADIUS_M;
+  for (const geo of geos ?? []) {
+    // GeoJSON order: [minLng, minLat, maxLng, maxLat]. Skip anything that
+    // doesn't look like that rather than deriving a nonsense radius from it.
+    const bounds = geo.bounds;
+    if (!bounds) continue;
+    const [minLng, minLat, maxLng, maxLat] = bounds;
+    if (Math.abs(minLat) > 90 || Math.abs(maxLat) > 90) continue;
+    if (Math.abs(minLng) > 180 || Math.abs(maxLng) > 180) continue;
+    const halfDiagonalM =
+      (haversineKm({ lat: minLat, lng: minLng }, { lat: maxLat, lng: maxLng }) *
+        1000) /
+      2;
+    radius = Math.max(radius, halfDiagonalM);
+  }
+  return Math.min(Math.round(radius), MAX_SEARCH_RADIUS_M);
+}
+
+export function suggestionName(suggestion: PlaceSuggestion): string {
+  const main = suggestion.structured_formatting?.main_text?.trim();
+  if (main) return main;
+  return (suggestion.description ?? "").split(",")[0]!.trim();
+}
+
+export function suggestionAddress(suggestion: PlaceSuggestion): string {
+  const secondary = suggestion.structured_formatting?.secondary_text?.trim();
+  if (secondary) return secondary;
+  return (suggestion.description ?? "").split(",").slice(1).join(",").trim();
+}
+
+export type PlaceCandidate = {
+  suggestion: PlaceSuggestion;
+  name: string;
+  score: number;
+};
+
+export type PlaceQueryOutcome =
+  | { kind: "none" }
+  | {
+      kind: "resolved";
+      detail: PlaceData;
+      score: number;
+      /** null when the place record carries no geometry. */
+      distanceKm: number | null;
+      usedUnbiasedSearch: boolean;
+    }
+  | {
+      kind: "ambiguous";
+      /** Ordered best-first. Non-empty. */
+      candidates: PlaceCandidate[];
+      reason: "low_confidence" | "tie";
+      usedUnbiasedSearch: boolean;
+    };
+
+/**
+ * Biased autocomplete first, then the same query with the bias removed. The
+ * fallback is what makes a day trip resolve at all: a biased search for a
+ * beach 50km outside the anchor city can come back empty.
+ */
+async function autocompleteWithFallback(
+  ctx: AppContext,
+  query: string,
+  center: { lat: number; lng: number },
+  radiusM: number,
+): Promise<{ predictions: PlaceSuggestion[]; usedUnbiasedSearch: boolean }> {
+  const location = { latitude: center.lat, longitude: center.lng };
+  const search = (radius: number) =>
+    ctx.rest.searchPlacesAutocomplete({
+      input: query,
+      sessionToken: crypto.randomUUID(),
+      location,
+      radius,
+    });
+
+  let biased: PlaceSuggestion[];
+  try {
+    biased = await search(radiusM);
+  } catch (err) {
+    // These radii are wider than anything this tool has sent before. If the
+    // API turns one down, degrade to the radius that has always worked rather
+    // than breaking the search outright.
+    if (radiusM <= LEGACY_SEARCH_RADIUS_M) throw err;
+    biased = await search(LEGACY_SEARCH_RADIUS_M);
+  }
+  if (biased.length > 0) {
+    return { predictions: biased, usedUnbiasedSearch: false };
+  }
+
+  try {
+    return { predictions: await search(UNBIASED_SEARCH_RADIUS_M), usedUnbiasedSearch: true };
+  } catch {
+    // The biased call already succeeded, so auth and the endpoint are fine and
+    // this failure is about the request itself. Report the honest "nothing
+    // found" for the query instead of a transport error.
+    return { predictions: [], usedUnbiasedSearch: false };
+  }
+}
+
+/**
+ * Resolve a place-name query to full PlaceData, or to the candidate list the
+ * caller has to choose from. An unambiguous hit costs one autocomplete call
+ * plus one details call, same as before.
+ */
+export async function resolvePlaceQuery(
+  ctx: AppContext,
+  query: string,
+  center: { lat: number; lng: number },
+  radiusM: number,
+): Promise<PlaceQueryOutcome> {
+  const { predictions, usedUnbiasedSearch } = await autocompleteWithFallback(
+    ctx,
+    query,
+    center,
+    radiusM,
+  );
+  if (predictions.length === 0) return { kind: "none" };
+
+  const scored: PlaceCandidate[] = predictions.map((suggestion) => {
+    const name = suggestionName(suggestion);
+    return { suggestion, name, score: placeMatchScore(query, name) };
+  });
+  // Sort is stable, so equally-scored candidates keep Google's ranking.
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0]!;
+  const runnerUp = scored[1];
+  const decisive = !runnerUp || best.score - runnerUp.score >= TIE_GAP;
+  const candidates = scored.slice(0, MAX_PLACE_CANDIDATES);
+
+  if (!decisive) {
+    return {
+      kind: "ambiguous",
+      candidates,
+      reason: best.score >= CONFIDENT_SCORE ? "tie" : "low_confidence",
+      usedUnbiasedSearch,
+    };
+  }
+
+  const detail = await ctx.rest.getPlaceDetails(best.suggestion.place_id);
+  // A prediction's main_text is sometimes a localized or abbreviated form of
+  // the real name, so let a clear front-runner prove itself on the full record
+  // before making the caller choose.
+  const score = Math.max(best.score, placeMatchScore(query, detail.name ?? ""));
+  if (score < CONFIDENT_SCORE) {
+    return {
+      kind: "ambiguous",
+      candidates,
+      reason: "low_confidence",
+      usedUnbiasedSearch,
+    };
+  }
+
+  const location = detail.geometry?.location;
+  return {
+    kind: "resolved",
+    detail,
+    score,
+    distanceKm: location ? haversineKm(center, location) : null,
+    usedUnbiasedSearch,
+  };
+}
+
+/**
+ * Numbered candidate list in the disambiguation shape used by edit-expense and
+ * annotate-place: a text response with isError: true, and nothing written.
+ */
+export function formatPlaceCandidates(candidates: PlaceCandidate[]): string {
+  return candidates
+    .map((candidate, i) => {
+      const address = suggestionAddress(candidate.suggestion);
+      return `  ${i + 1}. ${candidate.name}${address ? ` (${address})` : ""}`;
+    })
+    .join("\n");
+}
+
+export function buildPlaceAmbiguityText(args: {
+  query: string;
+  tripTitle: string;
+  candidates: PlaceCandidate[];
+  reason: "low_confidence" | "tie";
+  toolName: string;
+  argName: string;
+}): string {
+  const lead =
+    args.reason === "tie"
+      ? `"${args.query}" matches these ${args.candidates.length} places about equally well — picking one would be a guess:`
+      : `No search result for "${args.query}" plausibly is that place, so it was not resolved. Closest candidates:`;
+  return [
+    lead,
+    formatPlaceCandidates(args.candidates),
+    "",
+    `Nothing was added to "${args.tripTitle}". Re-call ${args.toolName} with "${args.argName}" set to the exact name of the one you want (copy it from this list), or call wanderlog_search_places to see more options.`,
+  ].join("\n");
+}
+
+/**
+ * A wrong city is the failure this catches: a place 400km from the anchor is
+ * either a real day trip or a same-named place somewhere else, and the caller
+ * can only tell which if the confirmation says so.
+ */
+export function farFromCenterNote(
+  distanceKm: number | null,
+  usedUnbiasedSearch: boolean,
+): string | null {
+  if (distanceKm === null || distanceKm < FAR_FROM_CENTER_KM) return null;
+  const how = usedUnbiasedSearch ? ", found without location bias" : "";
+  return `Resolved ${Math.round(distanceKm)} km from the trip center${how} — confirm this is the intended city.`;
+}
+
 /** Resolve a place-name query to full PlaceData, biased to the trip center. */
 export async function resolveEndpointPlace(
   ctx: AppContext,
@@ -504,12 +819,12 @@ export async function resolveEndpointPlace(
       "This trip has no associated geo and no existing places.",
     );
   }
-  const predictions = await ctx.rest.searchPlacesAutocomplete({
-    input: query,
-    sessionToken: crypto.randomUUID(),
-    location: { latitude: center.lat, longitude: center.lng },
-    radius: 15000,
-  });
+  const { predictions } = await autocompleteWithFallback(
+    ctx,
+    query,
+    center,
+    tripSearchRadiusM(geos),
+  );
   if (predictions.length === 0) {
     throw new WanderlogError(
       `No place found matching "${query}" near ${trip.title}`,

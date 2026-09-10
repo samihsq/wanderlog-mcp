@@ -6,14 +6,18 @@ import { noteTextToDelta } from "../ot/rich-text.js";
 import { resolveDay } from "../resolvers/day.js";
 import type { PlaceData } from "../types.js";
 import {
+  buildPlaceAmbiguityText,
   buildPlaceBlock,
+  farFromCenterNote,
   findBlockById,
   findDaySectionByDate,
   findPlacesToVisitSection,
   findSectionByRef,
   findTripCenter,
   requireUserId,
+  resolvePlaceQuery,
   submitOp,
+  tripSearchRadiusM,
   validateTimeInputs,
 } from "./shared.js";
 
@@ -26,7 +30,7 @@ export const addPlaceInputSchema = {
     .string()
     .min(1)
     .describe(
-      "Name of the place to add. Examples: 'Sensō-ji', 'a ramen place in Shinjuku', 'Louvre'. Will be matched against Google Places near the trip's destination; if multiple match, the top result is used.",
+      "Name of the place to add. Examples: 'Sensō-ji', 'Yuigahama Beach', 'Louvre'. Matched against Google Places, biased toward the trip's destination but not restricted to it, so day trips resolve too. Be specific: if the best match is not clearly the place you named, or two matches are equally good, the tool adds nothing and returns candidates for you to choose from.",
     ),
   day: z
     .string()
@@ -76,7 +80,8 @@ wanderlog_add_note call because the note lives on the place itself in the itiner
 Use standalone wanderlog_add_note only for freestanding commentary between places (neighborhood
 context, multi-stop transit, day-level tips that aren't about a specific place).
 
-Returns a confirmation including the resolved place name and where it was added.
+Returns a confirmation including the resolved place name, its full address, and where it was
+added — check the address, because a name alone can hide a wrong match.
 `.trim();
 
 type Args = {
@@ -105,13 +110,13 @@ export async function addPlace(
         "This trip has no associated geo and no existing places. Add a place via the Wanderlog UI first.",
       );
     }
-    const predictions = await ctx.rest.searchPlacesAutocomplete({
-      input: args.place,
-      sessionToken: crypto.randomUUID(),
-      location: { latitude: center.lat, longitude: center.lng },
-      radius: 15000,
-    });
-    if (predictions.length === 0) {
+    const resolution = await resolvePlaceQuery(
+      ctx,
+      args.place,
+      center,
+      tripSearchRadiusM(entry.geos),
+    );
+    if (resolution.kind === "none") {
       throw new WanderlogError(
         `No place found matching "${args.place}" near ${entry.snapshot.title}`,
         "place_not_found",
@@ -124,8 +129,27 @@ export async function addPlace(
         },
       );
     }
-    const topPrediction = predictions[0]!;
-    const detail: PlaceData = await ctx.rest.getPlaceDetails(topPrediction.place_id);
+    // Guessing between candidates is how the wrong place gets written silently,
+    // so hand the choice back and leave the trip untouched.
+    if (resolution.kind === "ambiguous") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: buildPlaceAmbiguityText({
+              query: args.place,
+              tripTitle: entry.snapshot.title,
+              candidates: resolution.candidates,
+              reason: resolution.reason,
+              toolName: "wanderlog_add_place",
+              argName: "place",
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const detail: PlaceData = resolution.detail;
     const imageKeys = await ctx.rest.getPlacePhotos(detail);
 
     const mutation = await submitOp(ctx, args.trip_key, async (lockedEntry, submit) => {
@@ -233,8 +257,11 @@ export async function addPlace(
       };
     });
 
+    // Echo the resolved address, not just the name: it is the only thing in the
+    // transcript that makes a wrong-but-plausible match visible after the write.
+    const where = detail.formatted_address ? ` (${detail.formatted_address})` : "";
     const parts = [
-      `Added ${detail.name} to ${mutation.labelList} in "${mutation.tripTitle}".`,
+      `Added ${detail.name}${where} to ${mutation.labelList} in "${mutation.tripTitle}".`,
     ];
     if (args.start_time) {
       parts.push(`Scheduled: ${args.start_time}${args.end_time ? `–${args.end_time}` : ""}.`);
@@ -243,6 +270,8 @@ export async function addPlace(
       const preview = args.note.length > 60 ? `${args.note.slice(0, 57)}…` : args.note;
       parts.push(`Note: "${preview}"`);
     }
+    const far = farFromCenterNote(resolution.distanceKm, resolution.usedUnbiasedSearch);
+    if (far) parts.push(far);
     const text = parts.join(" ");
     return { content: [{ type: "text", text }] };
   } catch (err) {

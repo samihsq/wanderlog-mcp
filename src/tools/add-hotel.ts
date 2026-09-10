@@ -4,11 +4,15 @@ import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { PlaceData } from "../types.js";
 import {
+  buildPlaceAmbiguityText,
   buildPlaceBlock,
+  farFromCenterNote,
   findHotelsSection,
   findTripCenter,
   requireUserId,
+  resolvePlaceQuery,
   submitOp,
+  tripSearchRadiusM,
 } from "./shared.js";
 
 export const addHotelInputSchema = {
@@ -17,7 +21,7 @@ export const addHotelInputSchema = {
     .string()
     .min(1)
     .describe(
-      "Hotel name to search for. Examples: 'Park Hyatt Tokyo', 'the cheap hostel near the train station'. Matched against Google Places near the trip's destination.",
+      "Hotel name to search for. Examples: 'Park Hyatt Tokyo', 'Hoshinoya Kyoto'. Matched against Google Places, biased toward the trip's destination but not restricted to it. Be specific: if the best match is not clearly the hotel you named, or two matches are equally good, the tool adds nothing and returns candidates for you to choose from.",
     ),
   check_in: z
     .string()
@@ -33,7 +37,8 @@ export const addHotelDescription = `
 Adds a hotel booking to a Wanderlog trip with check-in and check-out dates. If the trip does
 not yet have a "Hotels and lodging" section, one is created automatically.
 
-Returns confirmation with the resolved hotel name and the booking window.
+Returns confirmation with the resolved hotel name, its full address, and the booking window —
+check the address, because a name alone can hide a wrong match.
 `.trim();
 
 type Args = {
@@ -64,20 +69,40 @@ export async function addHotel(
       );
     }
 
-    const predictions = await ctx.rest.searchPlacesAutocomplete({
-      input: args.hotel,
-      sessionToken: crypto.randomUUID(),
-      location: { latitude: center.lat, longitude: center.lng },
-      radius: 15000,
-    });
-    if (predictions.length === 0) {
+    const resolution = await resolvePlaceQuery(
+      ctx,
+      args.hotel,
+      center,
+      tripSearchRadiusM(entry.geos),
+    );
+    if (resolution.kind === "none") {
       throw new WanderlogError(
         `No hotel found matching "${args.hotel}" near ${entry.snapshot.title}`,
         "hotel_not_found",
         "Try a more specific name or check the spelling.",
       );
     }
-    const detail: PlaceData = await ctx.rest.getPlaceDetails(predictions[0]!.place_id);
+    // Booking the wrong building is worse than asking, so leave the trip
+    // untouched and let the caller pick.
+    if (resolution.kind === "ambiguous") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: buildPlaceAmbiguityText({
+              query: args.hotel,
+              tripTitle: entry.snapshot.title,
+              candidates: resolution.candidates,
+              reason: resolution.reason,
+              toolName: "wanderlog_add_hotel",
+              argName: "hotel",
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const detail: PlaceData = resolution.detail;
     const imageKeys = await ctx.rest.getPlacePhotos(detail);
 
     const tripTitle = await submitOp(ctx, args.trip_key, async (lockedEntry, submit) => {
@@ -120,8 +145,15 @@ export async function addHotel(
       return trip.title;
     });
 
-    const text = `Added ${detail.name} to "${tripTitle}" · check-in ${args.check_in} → check-out ${args.check_out}.`;
-    return { content: [{ type: "text", text }] };
+    // Echo the resolved address, not just the name: it is the only thing in the
+    // transcript that makes a wrong-but-plausible match visible after the write.
+    const where = detail.formatted_address ? ` (${detail.formatted_address})` : "";
+    const parts = [
+      `Added ${detail.name}${where} to "${tripTitle}" · check-in ${args.check_in} → check-out ${args.check_out}.`,
+    ];
+    const far = farFromCenterNote(resolution.distanceKm, resolution.usedUnbiasedSearch);
+    if (far) parts.push(far);
+    return { content: [{ type: "text", text: parts.join(" ") }] };
   } catch (err) {
     const msg =
       err instanceof WanderlogError
