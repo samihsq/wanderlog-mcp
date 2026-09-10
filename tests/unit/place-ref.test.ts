@@ -91,6 +91,15 @@ describe("resolvePlaceRef", () => {
     }
   });
 
+  it("resolves an ASCII ref against a macron'd name", () => {
+    const result = resolvePlaceRef(mixedBlocksTrip, "Senso-ji");
+    expect(result.kind).toBe("unique");
+    if (result.kind !== "unique") return;
+    if (isPlaceBlock(result.match.block)) {
+      expect(result.match.block.place.name).toBe("Sensō-ji");
+    }
+  });
+
   it("resolves a compound 'place on day N' reference", () => {
     const result = resolvePlaceRef(mixedBlocksTrip, "Sensō-ji on day 1");
     expect(result.kind).toBe("unique");
