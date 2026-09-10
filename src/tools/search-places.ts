@@ -2,7 +2,10 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { PlaceSuggestion } from "../types.js";
-import { findTripCenter } from "./shared.js";
+import {
+  findTripCenter,
+  tripSearchRadiusM,
+} from "./shared.js";
 
 export const searchPlacesInputSchema = {
   trip_key: z
@@ -62,7 +65,7 @@ export async function searchPlaces(
       input: args.query,
       sessionToken: crypto.randomUUID(),
       location: { latitude: center.lat, longitude: center.lng },
-      radius: 15000,
+      radius: tripSearchRadiusM(entry.geos),
     });
 
     if (predictions.length === 0) {

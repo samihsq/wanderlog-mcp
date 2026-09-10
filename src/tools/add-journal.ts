@@ -3,7 +3,12 @@ import type { AppContext } from "../context.js";
 import { WanderlogError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { JournalStop, PlaceData } from "../types.js";
-import { findTripCenter, generateBlockId, submitOp } from "./shared.js";
+import {
+  findTripCenter,
+  generateBlockId,
+  submitOp,
+  tripSearchRadiusM,
+} from "./shared.js";
 import { findTripPlaces, getJournalStops, placeItineraryDate } from "./journal-shared.js";
 
 export const addJournalInputSchema = {
@@ -96,7 +101,7 @@ export async function addJournal(
         input: args.place,
         sessionToken: crypto.randomUUID(),
         location: { latitude: center.lat, longitude: center.lng },
-        radius: 15000,
+        radius: tripSearchRadiusM(entry.geos),
       });
       if (predictions.length === 0) {
         throw new WanderlogError(
