@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
+import { noteTextToDelta } from "../ot/rich-text.js";
 import { resolveDay } from "../resolvers/day.js";
 import type { PlaceData } from "../types.js";
 import {
@@ -43,7 +44,13 @@ export const addPlaceInputSchema = {
     .string()
     .optional()
     .describe(
-      "Optional inline note attached directly to this place. Use for practical context: transit directions, what to order, booking tips, time guidance. Appears on the place itself in Wanderlog (not as a separate note block).",
+      "Optional inline note attached directly to this place. Use for practical context: transit directions, what to order, booking tips, time guidance. Appears on the place itself in Wanderlog (not as a separate note block). Markdown is rendered as rich text: **bold**, *italic*, `code`, [links](https://example.com), \"- \" bullets.",
+    ),
+  format: z
+    .enum(["markdown", "plain"])
+    .optional()
+    .describe(
+      "How to interpret 'note'. \"markdown\" (the default) converts markdown to Wanderlog rich text. \"plain\" stores it verbatim.",
     ),
   start_time: z
     .string()
@@ -78,6 +85,7 @@ type Args = {
   day?: string;
   section?: string;
   note?: string;
+  format?: "markdown" | "plain";
   start_time?: string;
   end_time?: string;
 };
@@ -192,7 +200,7 @@ export async function addPlace(
                 "text",
               ],
               t: "rich-text",
-              o: [{ insert: `${args.note}\n` }],
+              o: noteTextToDelta(args.note, args.format ?? "markdown"),
             },
           ]);
         }

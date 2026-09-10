@@ -2,8 +2,9 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
+import { noteTextToDelta, replaceDeltaOps } from "../ot/rich-text.js";
 import { resolvePlaceRef } from "../resolvers/place-ref.js";
-import { isPlaceBlock } from "../types.js";
+import { isPlaceBlock, type QuillDelta } from "../types.js";
 import { assertBlockAtPath, findBlockById, submitOp, validateTimeInputs } from "./shared.js";
 
 export const annotatePlaceInputSchema = {
@@ -20,7 +21,15 @@ export const annotatePlaceInputSchema = {
   note: z
     .string()
     .optional()
-    .describe("Set or replace the inline note on this place. Practical context: transit, tips, timing, what to see."),
+    .describe(
+      "Set or replace the inline note on this place. Practical context: transit, tips, timing, what to see. Markdown is rendered as rich text by default: **bold**, *italic*, `code`, [links](https://example.com), \"- \" bullets, \"# \" headings.",
+    ),
+  format: z
+    .enum(["markdown", "plain"])
+    .optional()
+    .describe(
+      "How to interpret 'note'. \"markdown\" (the default) converts markdown to Wanderlog rich text. \"plain\" stores it verbatim.",
+    ),
   start_time: z
     .string()
     .regex(/^\d{2}:\d{2}$/, "must be HH:mm")
@@ -48,6 +57,7 @@ type Args = {
   trip_key: string;
   place: string;
   note?: string;
+  format?: "markdown" | "plain";
   start_time?: string;
   end_time?: string;
 };
@@ -63,6 +73,16 @@ export async function annotatePlace(
         "At least one of note, start_time, or end_time must be provided",
       );
     }
+
+    const noteDeltaOps = args.note
+      ? noteTextToDelta(args.note, args.format ?? "markdown")
+      : [];
+    // Markdown markers are consumed by the conversion, so verify against the
+    // text the delta actually carries rather than the raw argument.
+    const expectedNoteText = noteDeltaOps
+      .map((op) => op.insert ?? "")
+      .join("")
+      .trim();
 
     const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
       const resolved = resolvePlaceRef(entry.snapshot, args.place);
@@ -104,7 +124,15 @@ export async function annotatePlace(
       if (args.note) {
         const current = findBlockById(entry.snapshot, blockId);
         if (!current) throw new WanderlogError("Place moved or was removed", "stale_target");
-        assertBlockAtPath(entry.snapshot, current.sectionIndex, current.blockIndex, blockId);
+        const block = assertBlockAtPath(
+          entry.snapshot,
+          current.sectionIndex,
+          current.blockIndex,
+          blockId,
+        );
+        // "Set or replace" — drop whatever is there before inserting, otherwise
+        // the new note is prepended to the old one.
+        const existingText = (block as { text?: QuillDelta }).text;
         const textOps: Json0Op[] = [
           {
             p: [
@@ -116,7 +144,7 @@ export async function annotatePlace(
               "text",
             ],
             t: "rich-text",
-            o: [{ insert: `${args.note}\n` }],
+            o: replaceDeltaOps(existingText, noteDeltaOps),
           },
         ];
         await submit(textOps);
@@ -165,7 +193,7 @@ export async function annotatePlace(
         ?.map((op) => (typeof op.insert === "string" ? op.insert : ""))
         .join("");
       if (
-        (args.note && !noteText?.includes(args.note)) ||
+        (args.note && !noteText?.includes(expectedNoteText)) ||
         (args.start_time && record.startTime !== args.start_time) ||
         (args.end_time && record.endTime !== args.end_time)
       ) {

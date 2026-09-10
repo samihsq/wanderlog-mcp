@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
+import { noteTextToDelta } from "../ot/rich-text.js";
 import type { TripPlan } from "../types.js";
 import {
   buildNoteBlock,
@@ -24,7 +25,15 @@ export const addNoteInputSchema = z
     text: z
       .string()
       .min(1)
-      .describe("The note text. Plain text — can be multi-line."),
+      .describe(
+        "The note text. Markdown is rendered as rich text by default: **bold**, *italic*, ~~strike~~, `code`, [links](https://example.com), # / ## / ### headings, \"- \" bullets, \"1. \" numbered lists, \"> \" quotes, and two-space indentation for nested list items. Can be multi-line. Escape a marker with a backslash to keep it literal, or pass format: \"plain\" to disable parsing entirely.",
+      ),
+    format: z
+      .enum(["markdown", "plain"])
+      .optional()
+      .describe(
+        "How to interpret 'text'. \"markdown\" (the default) converts markdown to Wanderlog rich text. \"plain\" stores the text verbatim, markers and all.",
+      ),
     day: z
       .string()
       .min(1)
@@ -54,6 +63,11 @@ When to add a note (do this after adding each place or group of places):
 - Food/drink recs: "Try the salt beef bagel at Beigel Bake — cash only, open 24hrs"
 - Time guidance: "Budget 2-3 hours here. Open 10am-6pm, closed Tuesdays"
 - Neighborhood context: "This area is great for wandering — no rush, just explore the lanes"
+
+Formatting: 'text' is markdown by default, so use **bold** for emphasis, "- " bullets for
+lists of options, "## " headings to group a long note, and [links](https://example.com) for
+bookings and maps. Keep it light — a note is a sentence or two, not a document. Pass
+format: "plain" when the text must be stored verbatim.
 
 Returns a confirmation of where the note was added.
 `.trim();
@@ -127,7 +141,7 @@ export async function addNote(
             "text",
           ],
           t: "rich-text",
-          o: [{ insert: `${args.text}\n` }],
+          o: noteTextToDelta(args.text, args.format ?? "markdown"),
         },
       ];
       await submit(textOps);

@@ -116,7 +116,7 @@ describe("addNote section targeting", () => {
     expect(submittedOps[1]![0]).toMatchObject({
       p: ["itinerary", "sections", 0, "blocks", 0, "text"],
       t: "rich-text",
-      o: [{ insert: "Keep passport copies here\n" }],
+      o: [{ insert: "Keep passport copies here" }, { insert: "\n" }],
     });
   });
 

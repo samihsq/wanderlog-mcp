@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { WanderlogError } from "../errors.js";
-import type { TripPlan } from "../types.js";
+import type { QuillDelta, TripPlan } from "../types.js";
+import { composeDelta, type DeltaOp } from "./rich-text.js";
 
 export type Json0Op = {
   p: (string | number)[];
@@ -70,54 +71,33 @@ function navigateParent(
 /**
  * Apply a Quill Delta "rich-text" subtype op to a QuillDelta field.
  *
- * Quill Delta compose semantics: walk through the incoming ops in order.
- * `retain(n)` skips n characters, `insert(s)` inserts text, `delete(n)`
- * removes n characters. We rebuild the delta's plain-text string, then
- * write back a new `{ops: [{insert: result}]}`.
+ * Quill Delta compose semantics: walk the incoming ops in order. `retain(n)`
+ * skips n characters (applying `attributes` to them when present),
+ * `insert(s)` inserts text, `delete(n)` removes n characters.
  *
- * This is intentionally simplified — we flatten the existing delta to
- * plain text, apply the transform, and produce a single-insert delta.
- * Formatting attributes on the original text are lost, which is acceptable
- * because our tools only create plain-text notes. Remote rich-text edits
- * from the UI that carry attributes will lose formatting in our cache, but
- * the server holds the authoritative version.
+ * Formatting attributes are preserved on both sides: text the op retains
+ * keeps the attributes it already had, and inserts carry their own. That
+ * matters because our tools now write formatted notes (bold, links, lists),
+ * so flattening to plain text here would make the cache disagree with what
+ * Wanderlog renders.
  */
 function applyRichTextOp(
   parent: JsonContainer,
   key: string | number,
   payload: unknown,
 ): void {
+  if (!Array.isArray(payload)) return;
+
   const target = Array.isArray(parent)
     ? parent[key as number]
     : (parent as Record<string, unknown>)[key as string];
 
-  // Extract current plain text from the QuillDelta
-  let current = "";
-  if (target && typeof target === "object" && "ops" in (target as Record<string, unknown>)) {
-    const ops = (target as { ops: Array<{ insert?: string }> }).ops;
-    if (Array.isArray(ops)) {
-      current = ops
-        .map((op) => (typeof op.insert === "string" ? op.insert : ""))
-        .join("");
-    }
-  }
+  const current =
+    target && typeof target === "object" && "ops" in (target as Record<string, unknown>)
+      ? (target as QuillDelta)
+      : undefined;
 
-  // Apply the delta ops to the current text
-  if (!Array.isArray(payload)) return;
-  let pos = 0;
-  let result = current;
-  for (const dop of payload as Array<Record<string, unknown>>) {
-    if (typeof dop.retain === "number") {
-      pos += dop.retain;
-    } else if (typeof dop.insert === "string") {
-      result = result.slice(0, pos) + dop.insert + result.slice(pos);
-      pos += dop.insert.length;
-    } else if (typeof dop.delete === "number") {
-      result = result.slice(0, pos) + result.slice(pos + dop.delete);
-    }
-  }
-
-  const newDelta = { ops: [{ insert: result }] };
+  const newDelta = composeDelta(current, payload as DeltaOp[]);
   if (Array.isArray(parent)) {
     parent[key as number] = newDelta;
   } else {
