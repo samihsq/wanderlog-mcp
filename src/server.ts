@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AppContext } from "./context.js";
+import { WanderlogError } from "./errors.js";
 import { VERSION } from "./version.js";
 import {
   addChecklist,
@@ -186,9 +187,25 @@ type ToolHandler = (
 }>;
 
 const lazyAuthAttempts = new WeakMap<AppContext, Promise<boolean>>();
+const lastAuthFailure = new WeakMap<AppContext, number>();
+
+/**
+ * How long a failed auth probe is trusted. Caching the failure stops an
+ * invalid cookie from being re-probed on every single call, but caching it
+ * forever meant one transient network blip at startup bricked the session
+ * until the process restarted — indistinguishable, to the user, from a bad
+ * cookie.
+ */
+const AUTH_RETRY_AFTER_MS = 30_000;
 
 async function ensureAuthenticated(ctx: AppContext): Promise<boolean> {
   if (ctx.authenticated) return true;
+
+  const failedAt = lastAuthFailure.get(ctx);
+  if (failedAt !== undefined && Date.now() - failedAt >= AUTH_RETRY_AFTER_MS) {
+    lazyAuthAttempts.delete(ctx);
+    lastAuthFailure.delete(ctx);
+  }
 
   let attempt = lazyAuthAttempts.get(ctx);
   if (!attempt) {
@@ -203,7 +220,11 @@ async function ensureAuthenticated(ctx: AppContext): Promise<boolean> {
     lazyAuthAttempts.set(ctx, attempt);
   }
 
-  return attempt;
+  const authenticated = await attempt;
+  if (!authenticated && !lastAuthFailure.has(ctx)) {
+    lastAuthFailure.set(ctx, Date.now());
+  }
+  return authenticated;
 }
 
 export function requireAuth(
@@ -212,7 +233,21 @@ export function requireAuth(
 ) {
   return async (args: Record<string, unknown>) => {
     if (!(await ensureAuthenticated(ctx))) return AUTH_ERROR_RESPONSE;
-    return handler(args);
+    try {
+      return await handler(args);
+    } catch (err) {
+      // Tools catch their own errors, so anything arriving here is a bug or a
+      // schema rejection. Label it: an unlabelled throw reaches the client as
+      // a bare "Tool execution failed", which is indistinguishable from the
+      // server process having died.
+      const message =
+        err instanceof WanderlogError
+          ? err.toUserMessage()
+          : `Unexpected error in ${err instanceof Error ? err.name : "tool"}: ${
+              err instanceof Error ? err.message : String(err)
+            }`;
+      return { content: [{ type: "text" as const, text: message }], isError: true };
+    }
   };
 }
 
